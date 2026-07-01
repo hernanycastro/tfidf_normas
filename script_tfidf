@@ -1,0 +1,274 @@
+# ==============================================================================
+# SISTEMA AUTOMATIZADO COM WEB SCRAPING (1850 - 2026)
+# Alvos: Idosos, Pessoa com Deficiência e População em Situação de Rua
+# ==============================================================================
+
+setwd("seu caminho para o diretório de trabalho")
+
+# ==============================================================================
+# SISTEMA DE MINERAÇÃO LONGITUDINAL (1850 - 2026)
+# ==============================================================================
+
+if (!require("pacman")) install.packages("pacman")
+pacman::p_load(tidyverse, httr2, rvest, fs, pdftools, stringr, lubridate, tidytext, tm)
+
+
+dir_create("projeto_legislativo/brutos/modernos")
+dir_create("projeto_legislativo/brutos/historicos")
+dir_create("projeto_legislativo/processados")
+
+log_erro <- function(ano, mensagem) {
+  write(paste(now(), "| Ano:", ano, "| Erro:", mensagem), 
+        file = "projeto_legislativo/log_erros.txt", append = TRUE)
+}
+
+regex_idoso <- "(?i)idoso|idosa|velhice|terceira idade|anciã|asilo de inválido|decrepitude|ancianidade|asilo de velhos"
+regex_defic <- "(?i)deficiênc|defeito físico|defeito physico|inválido|invalidez|incapaz|excepciona|mutilado|surdo-mudo|cego|alienado|invalidos da patria"
+regex_rua   <- "(?i)situação de rua|população de rua|morador de rua|mendig|vadiag|vadi|indigent|sem domicilio|sem tecto|vabund|mendicidade|casa de detensão"
+regex_consolidada <- paste(regex_idoso, regex_defic, regex_rua, sep = "|")
+
+# URLs Estáveis do Planalto/Governo Federal (Evita erro 404 do Senado)
+mapear_links_historicos_estatico <- function() {
+  tibble(
+    ano = c(1850, 1870, 1888, 1890, 1910, 1922),
+    url = c(
+      "https://legislacao.presidencia.gov.br/atos-sucessor-incorporado/lei-581-4-setembro-1850", # Eusébio de Queirós
+      "https://legislacao.presidencia.gov.br/atos-sucessor-incorporado/lei-1836-20-setembro-1870", 
+      "https://legislacao.presidencia.gov.br/atos-sucessor-incorporado/lei-3353-13-maio-1888", # Áurea
+      "https://legislacao.presidencia.gov.br/atos-sucessor-incorporado/decreto-847-11-outubro-1890", # Cód. Penal Vadiagem
+      "https://legislacao.presidencia.gov.br/atos-sucessor-incorporado/decreto-2304-22-setembro-1910",
+      "https://legislacao.presidencia.gov.br/atos-sucessor-incorporado/decreto-4543-16-janeiro-1922"
+    )
+  )
+}
+
+processar_ano_historico <- function(ano, url_pdf) {
+  arquivo_rds <- paste0("projeto_legislativo/processados/historico_", ano, ".rds")
+  if (file_exists(arquivo_rds)) return(NULL)
+  
+  message(paste(">>> Processando Documento Histórico - Ano:", ano))
+  tryCatch({
+    # Como o Planalto usa páginas HTML em vez de PDFs diretos para Atos, capturamos o texto do HTML
+    html <- read_html(url_pdf)
+    texto_bruto <- html %>% html_text()
+    
+    if (str_detect(texto_bruto, regex_consolidada)) {
+      dados_historicos <- tibble(
+        id = paste0("HIST-", ano),
+        dataApresentacao = as.Date(paste0(ano, "-01-01")), 
+        ano_base = ano,
+        txtEmenta = str_sub(str_squish(texto_bruto), 1, 1000), 
+        flag_idoso = str_detect(texto_bruto, regex_idoso),
+        flag_defic = str_detect(texto_bruto, regex_defic),
+        flag_rua   = str_detect(texto_bruto, regex_rua),
+        periodo    = ifelse(ano < 1889, "Império", "República Velha")
+      )
+      write_rds(dados_historicos, arquivo_rds)
+    }
+  }, error = function(e) {
+    log_erro(ano, paste("Erro histórico:", e$message))
+  })
+}
+
+processar_ano_moderno <- function(ano) {
+  arquivo_rds <- paste0("projeto_legislativo/processados/moderno_", ano, ".rds")
+  if (file_exists(arquivo_rds)) return(NULL)
+  
+  message(paste(">>> Minerando dados da API da Câmara - Ano:", ano))
+  tryCatch({
+    url_fonte <- paste0("https://dadosabertos.camara.leg.br/arquivos/proposicoes/csv/proposicoes-", ano, ".csv")
+    arquivo_csv <- paste0("projeto_legislativo/brutos/modernos/prop_", ano, ".csv")
+    
+    request(url_fonte) %>% req_perform(path = arquivo_csv)
+    
+    dados_brutos <- read_delim(arquivo_csv, delim = ";", show_col_types = FALSE, guess_max = 1000)
+    colnames(dados_brutos) <- str_to_lower(colnames(dados_brutos))
+    
+    # PROTEÇÃO CONTRA COLUNAS FANTASMAS (Fora do mutate)
+    if (!"id" %in% names(dados_brutos)) dados_brutos$id <- NA_character_
+    if (!"txtementa" %in% names(dados_brutos) & "ementa" %in% names(dados_brutos)) dados_brutos$txtementa <- dados_brutos$ementa
+    if (!"txtementa" %in% names(dados_brutos)) dados_brutos$txtementa <- NA_character_
+    if (!"dataapresentacao" %in% names(dados_brutos) & "datainclusao" %in% names(dados_brutos)) dados_brutos$dataapresentacao <- dados_brutos$datainclusao
+    if (!"dataapresentacao" %in% names(dados_brutos)) dados_brutos$dataapresentacao <- NA_character_
+    
+    dados_ano <- dados_brutos %>% 
+      mutate(
+        texto_limpo = coalesce(as.character(txtementa), NA_character_)
+      ) %>% 
+      filter(!is.na(texto_limpo)) %>% 
+      filter(str_detect(texto_limpo, regex_consolidada)) %>% 
+      mutate(
+        id_final = coalesce(as.character(id), as.character(row_number())),
+        # Conversão segura de data
+        data_final = tryCatch(as.Date(dataapresentacao), error = function(e) as.Date(paste0(ano, "-01-01"))),
+        dataApresentacao = coalesce(data_final, as.Date(paste0(ano, "-01-01"))),
+        txtEmenta = texto_limpo,
+        ano_base = ano,
+        flag_idoso = str_detect(txtEmenta, regex_idoso),
+        flag_defic = str_detect(txtEmenta, regex_defic),
+        flag_rua   = str_detect(txtEmenta, regex_rua),
+        periodo    = "Republicano Moderno"
+      ) %>% 
+      select(id = id_final, dataApresentacao, txtEmenta, ano_base, flag_idoso, flag_defic, flag_rua, periodo)
+    
+    write_rds(dados_ano, arquivo_rds)
+    if (file_exists(arquivo_csv)) file_delete(arquivo_csv)
+    Sys.sleep(runif(1, 0.2, 0.8)) 
+    
+  }, error = function(e) {
+    log_erro(ano, paste("Falha na estrutura interna:", e$message))
+    if (file_exists(arquivo_csv)) file_delete(arquivo_csv)
+  })
+}
+
+# ==============================================================================
+# DISPARO DO CURSO ACELERADO DE CORREÇÃO
+# ==============================================================================
+message("\n=== DISPARANDO PIPELINE CORRIGIDO ===")
+if (file_exists("projeto_legislativo/log_erros.txt")) file_delete("projeto_legislativo/log_erros.txt")
+
+# Limpa tentativas quebradas anteriores para processar do zero de forma limpa
+dir_delete("projeto_legislativo/processados")
+dir_create("projeto_legislativo/processados")
+
+base_links_historicos <- mapear_links_historicos_estatico()
+pwalk(base_links_historicos, function(ano, url) processar_ano_historico(ano, url))
+
+anos_modernos <- 1930:2026
+anos_modernos %>% walk(~processar_ano_moderno(.x))
+
+# Consolidação
+arquivos_finais <- dir_ls("projeto_legislativo/processados", glob = "*.rds")
+if (length(arquivos_finais) > 0) {
+  corpus_brasil_176anos <- arquivos_finais %>% map_dfr(read_rds) %>% arrange(dataApresentacao)
+  write_csv(corpus_brasil_176anos, "projeto_legislativo/corpus_consolidado_1850_2026.csv")
+}
+
+# Impressão final de métricas
+cat("\n============================================================\n")
+cat("       RELATÓRIO REVISADO DE PERFORMANCE E COBERTURA        ")
+cat("\n============================================================\n\n")
+anos_concluidos <- arquivos_finais %>% basename() %>% str_extract("\\d{4}") %>% as.integer() %>% unique()
+cat("Anos consolidados com sucesso absoluto:", length(anos_concluidos), "de 109 possíveis.\n")
+if(length(arquivos_finais) > 0) print(corpus_brasil_176anos %>% group_by(periodo) %>% summarise(Atos = n(), Idosos = sum(flag_idoso), Defic = sum(flag_defic), Rua = sum(flag_rua)))
+
+# ==============================================================================
+# VISUALIZAÇÃO HISTÓRICA CORRIGIDA (SEM ANO ZERO)
+# ==============================================================================
+library(tidyverse)
+
+df_analise <- read_csv("projeto_legislativo/corpus_consolidado_1850_2026.csv", show_col_types = FALSE)
+
+# Transforma os dados para o formato longo (tidy) e limpa ruídos temporais
+df_timeline <- df_analise %>%
+  # FILTRO DE SEGURANÇA: Garante apenas o escopo real do seu projeto
+  filter(ano_base >= 1850 & ano_base <= 2026) %>% 
+  pivot_longer(
+    cols = c(flag_idoso, flag_defic, flag_rua),
+    names_to = "Grupo_Social",
+    values_to = "Ocorrencia"
+  ) %>%
+  filter(Ocorrencia == TRUE) %>%
+  mutate(
+    Grupo_Social = case_when(
+      Grupo_Social == "flag_idoso" ~ "Idosos",
+      Grupo_Social == "flag_defic" ~ "Pessoas com Deficiência",
+      Grupo_Social == "flag_rua"   ~ "Situação de Rua"
+    )
+  ) %>%
+  count(ano_base, Grupo_Social)
+
+# Plota o gráfico longitudinal corrigido
+ggplot(df_timeline, aes(x = ano_base, y = n, color = Grupo_Social, group = Grupo_Social)) +
+  # Corrigido de size para linewidth para eliminar a mensagem de aviso
+  geom_line(linewidth = 1.2, alpha = 0.8) +
+  geom_point(size = 1.5, alpha = 0.5) +
+  scale_color_viridis_d(option = "plasma") +
+  # Quebra o eixo X de 20 em 20 anos para ficar mais legível
+  scale_x_continuous(breaks = seq(1850, 2026, by = 20)) + 
+  labs(
+    title = "Evolução Temporal da Produção Legislativa por Grupo Social",
+    subtitle = "Análise longitudinal baseada em ementas federais (1850 - 2026)",
+    x = "Ano",
+    y = "Número de Atos Normativos",
+    color = "Grupo Vulnerável"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    legend.position = "bottom",
+    panel.grid.minor = element_blank(),
+    plot.title = element_text(face = "bold", size = 14),
+    axis.text.x = element_text(angle = 45, hjust = 1) # Inclina os anos para não encavalarem
+  )
+
+# ==============================================================================
+# PIPELINE DE TF-IDF NORMALIZADO: EQUILÍBRIO DE PESO HISTÓRICO (1930 - 2026)
+# ==============================================================================
+library(tidyverse)
+library(tidytext)
+
+# 1. Carregar a base de dados
+df_analise <- read_csv("projeto_legislativo/corpus_consolidado_1850_2026.csv", show_col_types = FALSE) %>% 
+  filter(ano_base >= 1930 & ano_base <= 2026)
+
+# 2. Estratégia de Normalização: Concatenar todo o texto por década antes da contagem
+df_super_documentos <- df_analise %>%
+  mutate(decada = paste0((ano_base %/% 10) * 10, "s")) %>% 
+  group_by(decada) %>% 
+  summarise(texto_consolidado = paste(txtEmenta, collapse = " "), .groups = "drop")
+
+# 3. Tokenização e Limpeza do Super Corpus (CORRIGIDO: %in% ajustado)
+palavras_normalizadas <- df_super_documentos %>%
+  unnest_tokens(palavra, texto_consolidado) %>% 
+  filter(!str_detect(palavra, "\\d+")) %>% 
+  filter(!palavra %in% tidytext::get_stopwords(language = "pt")$word) %>% 
+  filter(!palavra %in% c("lei", "art", "decreto", "nº", "público", "pública", "dispõe", 
+                         "providências", "altera", "nacional", "federal", "sobre", "daí", 
+                         "atividades", "geral", "efeitos", "outras", "capital", "republica"))
+
+# 4. Contagem de Termos 
+contagem_normalizada <- palavras_normalizadas %>%
+  count(decada, palavra, sort = TRUE)
+
+# 5. Cálculo do TF-IDF sobre a estrutura equilibrada de 10 décadas
+tf_idf_equilibrado <- contagem_normalizada %>%
+  bind_tf_idf(palavra, decada, n) %>% 
+  arrange(decada, desc(tf_idf))
+
+# 6. Selecionar o Top 5 de TODAS as décadas de 1930 a 2020 (Sem empates)
+top_termos_historicos <- tf_idf_equilibrado %>%
+  filter(decada %in% c("1930s", "1940s", "1950s", "1960s", "1970s", "1980s", "1990s", "2000s", "2010s", "2020s")) %>% 
+  group_by(decada) %>%
+  slice_max(tf_idf, n = 5, with_ties = FALSE) %>%
+  ungroup()
+
+# 7. Plotagem Espaçada em Painéis Expandidos (Atribuído à variável 'p')
+p <- ggplot(top_termos_historicos, aes(x = tf_idf, y = reorder_within(palavra, tf_idf, decada), fill = decada)) +
+  geom_col(show.legend = FALSE, width = 0.7) +
+  scale_y_reordered() +
+  facet_wrap(~decada, scales = "free_y", ncol = 2) + 
+  scale_fill_viridis_d(option = "turbo", begin = 0.1, end = 0.9) +
+  labs(
+    title = "Top 5 Palavras-Chave por Década (TF-IDF Normalizado)",
+    subtitle = "Pesos corrigidos proporcionalmente para neutralizar o viés volumétrico do presente",
+    x = "Importância Relativa Corrigida (Peso TF-IDF)",
+    y = "Termos do Vocabulário Político-Jurídico"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    plot.title = element_text(face = "bold", size = 13),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor = element_blank(),
+    strip.text = element_text(face = "bold", size = 10, color = "navy")
+  )
+
+# CÓDIGO PARA SALVAR EM ALTA RESOLUÇÃO:
+ggsave(
+  filename = "projeto_legislativo/grafico_tfidf_normalizado.png", # Caminho e nome do arquivo
+  plot = p,                                                        # O objeto do gráfico criado acima
+  device = "png",                                                 # Formato do arquivo
+  width = 18,                                                     # Largura ideal para uma página A4 com margens (em cm)
+  height = 24,                                                    # Altura estendida para acomodar os 10 painéis verticais
+  units = "cm",                                                   # Unidade de medida (centímetros)
+  dpi = 300                                                       # Alta resolução para impressão/Word
+)
